@@ -18,6 +18,7 @@ import {
 
 import Uri from 'vscode-uri';
 import * as path from 'path';
+import * as fs from 'fs';
 
 namespace Is {
 	const toString = Object.prototype.toString;
@@ -116,6 +117,7 @@ interface ESLintAutoFixEdit {
 }
 
 interface ESLintProblem {
+    fatal: string;
 	line: number;
 	column: number;
 	endLine?: number;
@@ -146,6 +148,7 @@ interface CLIOptions {
 
 interface CLIEngine {
 	executeOnText(content: string, file?:string): ESLintReport;
+	executeOnFiles([]): ESLintReport;
 }
 
 interface CLIEngineConstructor {
@@ -164,8 +167,9 @@ function makeDiagnostic(problem: ESLintProblem): Diagnostic {
 	let startLine = Math.max(0, problem.line - 1);
 	let startChar = Math.max(0, problem.column - 1);
 	let endLine = problem.endLine != null ? Math.max(0, problem.endLine - 1) : startLine;
-	let endChar = problem.endColumn != null ? Math.max(0, problem.endColumn - 1) : startChar;
+    let endChar = problem.endColumn != null ? Math.max(0, problem.endColumn - 1) : startChar;
 	return {
+        fatal: problem.fatal,        
 		message: message,
 		severity: convertSeverity(problem.severity),
 		source: 'eslint',
@@ -290,6 +294,7 @@ process.exit = (code?: number) => {
 
 let connection = createConnection(ProposedFeatures.all);
 let documents: TextDocuments = new TextDocuments();
+let projectValidationUri: string;
 
 let _globalNpmPath: string | null | undefined;
 function globalNpmPath(): string {
@@ -320,7 +325,7 @@ function globalYarnPath(): string {
 let path2Library: Map<string, ESLintModule> = new Map<string, ESLintModule>();
 let document2Settings: Map<string, Thenable<TextDocumentSettings>> = new Map<string, Thenable<TextDocumentSettings>>();
 
-function resolveSettings(document: TextDocument): Thenable<TextDocumentSettings> {
+function resolveSettings(document: any): Thenable<TextDocumentSettings> {
 	let uri = document.uri;
 	let resultPromise = document2Settings.get(uri);
 	if (resultPromise) {
@@ -530,6 +535,14 @@ messageQueue.onNotification(ValidateNotification.type, (document) => {
 	return document.version
 });
 
+namespace ValidateProjectNotification {
+	export const type: NotificationType<TextDocument, void> = new NotificationType<TextDocument, void>('eslint/validateProject');
+}
+
+messageQueue.onNotification(ValidateProjectNotification.type, () => {
+	validateProject();
+});
+
 // The documents manager listen for text document create, change
 // and close on the connection
 documents.listen(connection);
@@ -606,7 +619,7 @@ documents.onDidClose((event) => {
 		let uri = event.document.uri;
 		document2Settings.delete(uri);
 		codeActions.delete(uri);
-		if (settings.validate) {
+		if (settings.validate && !projectValidationUri) {
 			connection.sendDiagnostics({ uri: uri, diagnostics: [] });
 		}
 	});
@@ -623,23 +636,36 @@ function trace(message: string, verbose?: string): void {
 	connection.tracer.log(message, verbose);
 }
 
+
+function validateProject() {
+    return resolveSettings({uri: projectValidationUri}).then((settings) => {
+        let cli = new settings.library.CLIEngine(settings.options);
+        let report = cli.executeOnFiles([projectValidationUri + "/"]);
+        return convertReportToDiagnostics(report, settings, true, "", {});
+    });
+}
+
 connection.onInitialize((_params) => {
-	return {
-		capabilities: {
-			textDocumentSync: {
-				openClose: true,
-				change: TextDocumentSyncKind.Full,
-				willSaveWaitUntil: true,
-				save: {
-					includeText: false
-				}
-			},
-			codeActionProvider: true,
-			executeCommandProvider: {
-				commands: [CommandIds.applySingleFix, CommandIds.applySameFixes, CommandIds.applyAllFixes, CommandIds.applyAutoFix]
-			}
-		}
-	};
+	if (_params.initializationOptions && _params.initializationOptions.projectValidation){
+        projectValidationUri = _params.rootUri.substring("file://".length, _params.rootUri.length);        
+        messageQueue.addNotificationMessage(ValidateProjectNotification.type, {}, 0);
+    };
+        return {
+            capabilities: {
+            textDocumentSync: {
+                openClose: true,
+                change: TextDocumentSyncKind.Full,
+                willSaveWaitUntil: true,
+                save: {
+                    includeText: false
+                }
+            },
+            codeActionProvider: true,
+            executeCommandProvider: {
+                commands: [CommandIds.applySingleFix, CommandIds.applySameFixes, CommandIds.applyAllFixes, CommandIds.applyAutoFix]
+            }
+        }
+        };
 });
 
 connection.onInitialized(() => {
@@ -713,7 +739,7 @@ function validate(document: TextDocument, settings: TextDocumentSettings, publis
 	let newOptions: CLIOptions = Object.assign(Object.create(null), settings.options);
 	let content = document.getText();
 	let uri = document.uri;
-	let file = getFilePath(document);
+	let file = getFilePath(document) || uri;
 	let cwd = process.cwd();
 	try {
 		if (file) {
@@ -742,30 +768,38 @@ function validate(document: TextDocument, settings: TextDocumentSettings, publis
 		// Clean previously computed code actions.
 		codeActions.delete(uri);
 		let report: ESLintReport = cli.executeOnText(content, file);
-		let diagnostics: Diagnostic[] = [];
-		if (report && report.results && Array.isArray(report.results) && report.results.length > 0) {
-			let docReport = report.results[0];
-			if (docReport.messages && Array.isArray(docReport.messages)) {
-				docReport.messages.forEach((problem) => {
-					if (problem) {
-						let diagnostic = makeDiagnostic(problem);
-						diagnostics.push(diagnostic);
-						if (settings.autoFix) {
-							recordCodeAction(document, diagnostic, problem);
-						}
-					}
-				});
-			}
-		}
-		if (publishDiagnostics) {
-			connection.sendDiagnostics({ uri, diagnostics });
-		}
+		convertReportToDiagnostics(report, settings, publishDiagnostics, uri, document)		
 	} finally {
 		if (cwd !== process.cwd()) {
 			process.chdir(cwd);
 		}
 	}
 }
+
+function convertReportToDiagnostics(report: ESLintReport, settings: TextDocumentSettings, publishDiagnostics: boolean, uri: string, document: any) {
+    if (report && report.results && Array.isArray(report.results) && report.results.length > 0) {
+        for (let i = 0; i< report.results.length; i++) {
+			let diagnostics: Diagnostic[] = [];
+			let docReport = report.results[i];
+            let docUri = uri || "file://" + docReport.filePath;
+            if (docReport.messages && Array.isArray(docReport.messages)) {
+                docReport.messages.forEach((problem) => {
+                    if (problem) {
+                        let diagnostic = makeDiagnostic(problem);
+                        diagnostics.push(diagnostic);
+                        if (settings.autoFix && document) {
+                            recordCodeAction(document, diagnostic, problem);
+                        }
+                    }
+                });
+            }
+            if (publishDiagnostics) {
+                connection.sendDiagnostics({ uri: docUri, diagnostics: diagnostics });
+            }
+        }
+    }
+}
+
 
 let noConfigReported: Map<string, ESLintModule> = new Map<string, ESLintModule>();
 
@@ -900,9 +934,19 @@ messageQueue.registerNotification(DidChangeWatchedFilesNotification.type, (param
 				} catch (error) {
 				}
 			}
-		}
-	});
-	validateMany(documents.all());
+        }
+        if(projectValidationUri && fsPath.indexOf(".eslintrc") !== -1) {
+            messageQueue.addNotificationMessage(ValidateProjectNotification.type, {}, 0);
+        }
+        else if (projectValidationUri && change.type === 1){
+            let fileContent = fs.readFileSync(fsPath).toString();
+            let document = TextDocument.create("file://" + fsPath, "eslint", 0, fileContent);
+            messageQueue.addNotificationMessage(ValidateNotification.type, document, document.version);
+        }
+    });
+    if(!projectValidationUri){
+        validateMany(documents.all());
+    }
 });
 
 class Fixes {
