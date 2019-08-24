@@ -75,6 +75,7 @@ interface TextDocumentSettings {
 	packageManager: 'npm' | 'yarn' | 'pnpm';
 	autoFix: boolean;
 	autoFixOnSave: boolean;
+	hideAutoFix: boolean;
 	quiet: boolean;
 	options: any | undefined;
 	run: RunValues;
@@ -493,6 +494,7 @@ export function realActivate(context: ExtensionContext): void {
 							packageManager: config.get('packageManager', 'npm'),
 							autoFix: false,
 							autoFixOnSave: false,
+							hideAutoFix: false,
 							quiet: config.get('quiet', false),
 							options: config.get('options', {}),
 							run: config.get('run', 'onType'),
@@ -529,6 +531,7 @@ export function realActivate(context: ExtensionContext): void {
 						}
 						if (settings.validate) {
 							settings.autoFixOnSave = settings.autoFix && config.get('autoFixOnSave', false);
+							settings.hideAutoFix = settings.autoFixOnSave && config.get('hideAutoFixedIssues', false);
 						}
 						let workspaceFolder = Workspace.getWorkspaceFolder(resource);
 						if (workspaceFolder) {
