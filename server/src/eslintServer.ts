@@ -192,6 +192,7 @@ interface ESLintReport {
 
 interface CLIOptions {
 	cwd?: string;
+	fix?: boolean | {[key: string]: any};
 	fixTypes?: string[];
 	fix?: boolean;
 }
@@ -909,10 +910,50 @@ const ruleDocData: {
 	urls: new Map<string, string>()
 };
 
+interface LintResults {
+	[key: string]: any;
+}
+
+/**
+ * Given a parameter similar to this, we can filter by severity and/or types:
+ *
+ *   fix: {
+ *     severity: 2,
+ *     ruleId: ["foo", "bar"]
+ *   }
+ *
+ * Note: the field names are intentionally not validated against a whitelist so
+ * that should ESLint expose more fields this extension won't have to be updated.
+ */
+function makeFixFilter(fix: any = true) {
+	if (typeof fix === `object` && fix !== null) {
+		const checks = Object.keys(fix).map(field => {
+			if (Array.isArray(fix[field])) {
+				const accepted = new Set(fix[field]);
+				return (lintResults: LintResults) => accepted.has(lintResults[field]);
+			} else {
+				const accepted = fix[field];
+				return (lintResults: LintResults) => lintResults[field] === accepted;
+			}
+		});
+
+		return (lintResults: LintResults) => {
+			return checks.every(check => {
+				return check(lintResults);
+			});
+		};
+	} else {
+		return () => fix;
+	}
+}
 
 const validFixTypes = new Set<string>(['problem', 'suggestion', 'layout']);
 function validate(document: TextDocument, settings: TextDocumentSettings & { library: ESLintModule }, publishDiagnostics: boolean = true): void {
 	const newOptions: CLIOptions = Object.assign(Object.create(null), settings.options);
+
+	const fixFilter = makeFixFilter(newOptions.fix);
+	delete newOptions.fix;
+
 	let fixTypes: Set<string> | undefined = undefined;
 	if (Array.isArray(newOptions.fixTypes) && newOptions.fixTypes.length > 0) {
 		fixTypes = new Set();
@@ -972,15 +1013,17 @@ function validate(document: TextDocument, settings: TextDocumentSettings & { lib
 						}
 						const diagnostic = makeDiagnostic(problem);
 						diagnostics.push(diagnostic);
-						if (settings.autoFix) {
-							if (fixTypes !== undefined && CLIEngine.hasRule(cli) && problem.ruleId !== undefined && problem.fix !== undefined) {
-								const rule = cli.getRules().get(problem.ruleId);
-								if (RuleData.hasMetaType(rule) && fixTypes.has(rule.meta.type)) {
-									recordCodeAction(document, diagnostic, problem);
-								}
-							} else {
+						if (!settings.autoFix || !fixFilter(problem)) {
+							// We don't want to fix problems that don't pass the validation
+							return;
+						}
+						if (fixTypes !== undefined && isFunction(cli.getRules) && problem.ruleId !== undefined && problem.fix !== undefined) {
+							const rule = cli.getRules().get(problem.ruleId);
+							if (RuleData.hasMetaType(rule) && fixTypes.has(rule.meta.type)) {
 								recordCodeAction(document, diagnostic, problem);
 							}
+						} else {
+							recordCodeAction(document, diagnostic, problem);
 						}
 					}
 				});
